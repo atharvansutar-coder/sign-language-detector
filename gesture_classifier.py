@@ -1,221 +1,187 @@
 """
-Gesture classification module for recognizing different hand gestures.
+Gesture classification module for ISL sign recognition.
+
+Returns (gesture_id, gesture_name, confidence) for each frame.
+Rule-based — designed for extension with ML models (LSTM/Transformer) later.
 """
 import numpy as np
 from typing import List, Optional, Tuple
 
+from vocabulary import VOCABULARY, get_display
+
 
 class GestureClassifier:
     """Classify hand gestures based on finger positions and hand landmarks."""
-    
+
     def __init__(self):
-        """Initialize the gesture classifier."""
-        self.gesture_names = [
-            "Unknown",      # 0
-            "Letter A",     # 1
-            "Letter B",     # 2
-            "Letter C",     # 3
-            "Hi",           # 4
-            "Bye",          # 5
-            "Nice",         # 6
-            "Yes",          # 7
-            "No",           # 8
-            "Good Morning", # 9
-        ]
-    
-    def classify_gesture(self, landmarks: Optional[np.ndarray], 
-                        finger_count: int = 0,
-                        hand_label: Optional[str] = None) -> Tuple[int, str]:
+        self.gesture_names = [VOCABULARY[i]["display"] for i in sorted(VOCABULARY.keys())]
+        self._id_map = sorted(VOCABULARY.keys())
+
+    def classify_gesture(
+        self,
+        landmarks: Optional[np.ndarray],
+        finger_count: int = 0,
+        hand_label: Optional[str] = None,
+    ) -> Tuple[int, str, float]:
         """
         Classify hand gesture based on landmarks and finger count.
-        
-        Args:
-            landmarks: Array of hand landmarks (21, 2) or None.
-            finger_count: Number of extended fingers.
-            hand_label: "Left" or "Right" hand label.
-            
+
         Returns:
-            Tuple of (gesture_id, gesture_name).
+            (gesture_id, display_name, confidence 0–1)
         """
         if landmarks is None:
-            return 0, self.gesture_names[0]
-        
-        # Normalize landmarks relative to wrist (landmark 0)
-        normalized_landmarks = landmarks - landmarks[0]
-        
-        # Get gesture based on finger count and landmark analysis
-        gesture_id = self._analyze_gesture(normalized_landmarks, finger_count, hand_label)
-        
-        return gesture_id, self.gesture_names[gesture_id]
-    
-    def _get_distance(self, p1, p2):
-        """Calculate Euclidean distance between two points."""
-        return np.linalg.norm(np.array(p1) - np.array(p2))
+            return 0, get_display(0), 0.0
 
-    def _analyze_gesture(self, landmarks: np.ndarray, finger_count: int, hand_label: str) -> int:
-        """
-        Analyze landmarks to determine gesture type using strict ASL and social gesture rules.
-        
-        Args:
-            landmarks: Normalized landmark array (21, 2).
-            finger_count: Number of extended fingers.
-            hand_label: "Left" or "Right" hand label.
-            
-        Returns:
-            Gesture ID.
-        """
-        # Landmarks
-        wrist = landmarks[0]
-        thumb_cmc = landmarks[1]
-        thumb_mcp = landmarks[2]
-        thumb_ip = landmarks[3]
-        thumb_tip = landmarks[4]
-        
-        index_mcp = landmarks[5]
-        index_pip = landmarks[6]
-        index_dip = landmarks[7]
-        index_tip = landmarks[8]
-        
-        middle_mcp = landmarks[9]
-        middle_pip = landmarks[10]
-        middle_dip = landmarks[11]
-        middle_tip = landmarks[12]
-        
-        ring_mcp = landmarks[13]
-        ring_pip = landmarks[14]
-        ring_dip = landmarks[15]
-        ring_tip = landmarks[16]
-        
-        pinky_mcp = landmarks[17]
-        pinky_pip = landmarks[18]
-        pinky_dip = landmarks[19]
-        pinky_tip = landmarks[20]
-        
-        # Calculate hand scale (Wrist to Middle MCP) to make thresholds scale-invariant
-        hand_scale = self._get_distance(wrist, middle_mcp)
-        if hand_scale == 0: hand_scale = 1.0 # Prevent division by zero
-        
-        # --- Finger States ---
-        # A finger is "Up" if tip is significantly above PIP (y coordinate is smaller)
-        
-        index_up = index_tip[1] < index_pip[1]
-        middle_up = middle_tip[1] < middle_pip[1]
-        ring_up = ring_tip[1] < ring_pip[1]
-        pinky_up = pinky_tip[1] < pinky_pip[1]
-        
-        # A finger is "Down" (Curled) if tip is below PIP
+        normalized = landmarks - landmarks[0]
+        gesture_id, confidence = self._analyze_gesture(normalized, finger_count, hand_label)
+        return gesture_id, get_display(gesture_id), confidence
+
+    def _get_distance(self, p1, p2) -> float:
+        return float(np.linalg.norm(np.array(p1) - np.array(p2)))
+
+    def _finger_states(self, lm: np.ndarray, hand_scale: float, hand_label: str) -> dict:
+        """Compute finger up/down states and helper metrics."""
+        wrist, thumb_tip, thumb_ip = lm[0], lm[4], lm[3]
+        index_mcp, index_pip, index_tip = lm[5], lm[6], lm[8]
+        middle_mcp, middle_pip, middle_tip = lm[9], lm[10], lm[12]
+        ring_pip, ring_tip = lm[14], lm[16]
+        pinky_mcp, pinky_pip, pinky_tip = lm[17], lm[18], lm[20]
+
+        index_up = index_tip[1] < index_pip[1] - 0.02 * hand_scale
+        middle_up = middle_tip[1] < middle_pip[1] - 0.02 * hand_scale
+        ring_up = ring_tip[1] < ring_pip[1] - 0.02 * hand_scale
+        pinky_up = pinky_tip[1] < pinky_pip[1] - 0.02 * hand_scale
+
         index_down = index_tip[1] > index_pip[1]
         middle_down = middle_tip[1] > middle_pip[1]
         ring_down = ring_tip[1] > ring_pip[1]
         pinky_down = pinky_tip[1] > pinky_pip[1]
-        
-        # Thumb States
-        # Vertical: Tip is above IP (y coordinate is smaller)
-        thumb_vertical = thumb_tip[1] < thumb_ip[1]
-        
-        # Tucked: Tip is close to the palm center (approx Middle MCP) or Pinky MCP
-        dist_thumb_pinky_mcp = self._get_distance(thumb_tip, pinky_mcp)
-        thumb_tucked = dist_thumb_pinky_mcp < 0.6 * hand_scale
-        
-        # Extended Out: Tip is far from Index MCP in X direction
-        # Direction depends on hand label
+
+        thumb_vertical = thumb_tip[1] < thumb_ip[1] - 0.02 * hand_scale
+        dist_thumb_pinky = self._get_distance(thumb_tip, pinky_mcp)
+        thumb_tucked = dist_thumb_pinky < 0.55 * hand_scale
+
         if hand_label == "Left":
-            thumb_out = thumb_tip[0] < thumb_ip[0] - (0.1 * hand_scale)
-        else: # Right
-            thumb_out = thumb_tip[0] > thumb_ip[0] + (0.1 * hand_scale)
+            thumb_out = thumb_tip[0] < thumb_ip[0] - 0.08 * hand_scale
+        else:
+            thumb_out = thumb_tip[0] > thumb_ip[0] + 0.08 * hand_scale
 
-        # Debug print (uncomment to see live states)
-        print(f"I:{int(index_up)} M:{int(middle_up)} R:{int(ring_up)} P:{int(pinky_up)} | T_Vert:{int(thumb_vertical)} T_Out:{int(thumb_out)}")
-
-        # --- Gesture Logic ---
-        # ORDERED BY PRIORITY to prevent conflicts
-        
-        # PRIORITY 1: Fist-like gestures (A, Yes, No)
-        # Check these FIRST because they require ALL 4 fingers down
-        # This prevents confusion with other gestures that might have some fingers "slightly" up
-        if index_down and middle_down and ring_down and pinky_down:
-            
-            # Vertical Position of Thumb Tip relative to Index MCP
-            # Y increases downwards (screen coordinates)
-            
-            # YES (Thumbs Up): Thumb tip is HIGH above Index MCP
-            if thumb_tip[1] < index_mcp[1] - (0.2 * hand_scale):
-                if thumb_vertical:
-                    return 7 # Yes (Thumbs Up)
-            
-            # NO (Thumbs Down): Thumb tip is BELOW Index MCP
-            elif thumb_tip[1] > index_mcp[1] + (0.15 * hand_scale):
-                # Must be pointing down (Tip below IP)
-                if thumb_tip[1] > thumb_ip[1]:
-                    return 8 # No (Thumbs Down)
-            
-            # LETTER A: Thumb tip is LEVEL with Index MCP (middle zone)
-            else:
-                if thumb_vertical:
-                    dist_thumb_index = self._get_distance(thumb_tip, index_mcp)
-                    if dist_thumb_index < 0.5 * hand_scale:
-                        # Must be in the middle zone (not too high, not too low)
-                        if (thumb_tip[1] > index_mcp[1] - (0.1 * hand_scale) and 
-                            thumb_tip[1] < index_mcp[1] + (0.1 * hand_scale)):
-                            return 1 # Letter A
-            
-            # If none of the fist gestures matched, fall through to check others
-        
-        # PRIORITY 2: Four fingers up (Hi vs B)
-        # Check BEFORE Nice/C to avoid confusion
-        if index_up and middle_up and ring_up and pinky_up:
-            # Must check ring and pinky are CLEARLY up to avoid confusion with Nice
-            if ring_tip[1] < ring_pip[1] and pinky_tip[1] < pinky_pip[1]:
-                if thumb_tucked:
-                    return 2 # Letter B (Thumb tucked)
-                elif thumb_vertical or thumb_out:
-                    return 4 # Hi (Thumb extended/up)
-                else:
-                    return 4 # Hi (default when 4 fingers up)
-        
-        # PRIORITY 3: Nice (OK Sign)
-        # Thumb and Index tips VERY CLOSE (touching)
-        # Check BEFORE C to prioritize touching over curved
         dist_thumb_index_tip = self._get_distance(thumb_tip, index_tip)
-        
-        if dist_thumb_index_tip < 0.12 * hand_scale:  # Very strict - must be touching
-            # Other fingers should be up
-            if middle_up and ring_up and pinky_up:
-                return 6 # Nice (OK Sign)
-        
-        # PRIORITY 4: Two fingers up (Bye - Peace Sign)
-        # EXACTLY index and middle up, others down
-        if index_up and middle_up and ring_down and pinky_down:
-            # Make sure index and middle are CLEARLY up
-            if (index_tip[1] < index_pip[1] - (0.05 * hand_scale) and 
-                middle_tip[1] < middle_pip[1] - (0.05 * hand_scale)):
-                return 5 # Bye
-        
-        # PRIORITY 5: One finger up (Good Morning - Pointing)
-        # EXACTLY index up, others down
-        # Very strict to avoid false positives
-        if index_up and middle_down and ring_down and pinky_down:
-            # Index must be CLEARLY pointing up (well above knuckle)
-            if index_tip[1] < index_mcp[1] - (0.15 * hand_scale):
-                # Make sure other fingers are CLEARLY down
-                if (middle_tip[1] > middle_pip[1] and 
-                    ring_tip[1] > ring_pip[1] and 
-                    pinky_tip[1] > pinky_pip[1]):
-                    return 9 # Good Morning
-        
-        # PRIORITY 6: Letter C (Curved fingers)
-        # Check LAST among multi-finger gestures
-        # Requires index and middle up, with specific gap
-        if index_up and middle_up:
-            # Must have a "C" gap (bigger than Nice, smaller than open hand)
-            if 0.20 * hand_scale < dist_thumb_index_tip < 0.7 * hand_scale:
-                # Thumb should NOT be tucked (otherwise it's B or Hi)
-                if not thumb_tucked:
-                    # At least index and middle should be up, but not all 4
-                    # (to avoid confusion with Hi/B)
-                    if not (ring_up and pinky_up and thumb_out):
-                        return 3 # Letter C
+        dist_thumb_index_mcp = self._get_distance(thumb_tip, index_mcp)
 
-        return 0  # Unknown
+        return {
+            "hand_scale": hand_scale,
+            "index_up": index_up, "middle_up": middle_up,
+            "ring_up": ring_up, "pinky_up": pinky_up,
+            "index_down": index_down, "middle_down": middle_down,
+            "ring_down": ring_down, "pinky_down": pinky_down,
+            "thumb_vertical": thumb_vertical, "thumb_tucked": thumb_tucked,
+            "thumb_out": thumb_out,
+            "dist_thumb_index_tip": dist_thumb_index_tip,
+            "dist_thumb_index_mcp": dist_thumb_index_mcp,
+            "thumb_tip": thumb_tip, "thumb_ip": thumb_ip,
+            "index_mcp": index_mcp, "index_tip": index_tip,
+            "middle_tip": middle_tip, "middle_pip": middle_pip,
+            "ring_tip": ring_tip, "ring_pip": ring_pip,
+            "pinky_tip": pinky_tip, "pinky_pip": pinky_pip,
+            "wrist": wrist,
+        }
 
+    def _analyze_gesture(
+        self, landmarks: np.ndarray, finger_count: int, hand_label: str
+    ) -> Tuple[int, float]:
+        """Return (gesture_id, confidence)."""
+        hand_scale = self._get_distance(landmarks[0], landmarks[9])
+        if hand_scale == 0:
+            hand_scale = 1.0
 
+        s = self._finger_states(landmarks, hand_scale, hand_label or "Right")
+        hs = s["hand_scale"]
+
+        candidates: List[Tuple[int, float]] = []
+
+        def add(gid: int, conf: float) -> None:
+            if conf > 0:
+                candidates.append((gid, min(conf, 1.0)))
+
+        # --- Fist family: YES, NO, A, PAIN ---
+        if s["index_down"] and s["middle_down"] and s["ring_down"] and s["pinky_down"]:
+            if s["thumb_tip"][1] < s["index_mcp"][1] - 0.18 * hs and s["thumb_vertical"]:
+                conf = 0.7 + min(0.3, (s["index_mcp"][1] - s["thumb_tip"][1]) / hs * 0.3)
+                add(7, conf)   # YES
+            elif s["thumb_tip"][1] > s["index_mcp"][1] + 0.12 * hs:
+                conf = 0.65 + min(0.35, (s["thumb_tip"][1] - s["index_mcp"][1]) / hs * 0.3)
+                add(8, conf)   # NO
+            elif s["thumb_vertical"] and s["dist_thumb_index_mcp"] < 0.45 * hs:
+                add(1, 0.72)   # Letter A
+            else:
+                add(13, 0.68)  # PAIN (closed fist)
+
+        # --- Open palm: B, HELLO, STOP, HELP ---
+        if s["index_up"] and s["middle_up"] and s["ring_up"] and s["pinky_up"]:
+            if s["thumb_tucked"]:
+                add(2, 0.78)   # B / STOP
+                add(14, 0.72)  # STOP
+            elif s["thumb_out"] or s["thumb_vertical"]:
+                add(4, 0.80)   # HELLO
+                add(10, 0.70)  # HELP (open palm)
+                add(21, 0.65)  # THANK YOU
+
+        # --- OK sign: OK, MEDICINE, FAMILY ---
+        if s["dist_thumb_index_tip"] < 0.10 * hs:
+            if s["middle_up"] and s["ring_up"] and s["pinky_up"]:
+                add(6, 0.82)   # OK
+                add(18, 0.70)  # MEDICINE
+                add(20, 0.68)  # FAMILY
+
+        # --- Peace: GOODBYE ---
+        if s["index_up"] and s["middle_up"] and s["ring_down"] and s["pinky_down"]:
+            gap = abs(s["index_tip"][0] - s["middle_tip"][0])
+            conf = 0.75 + min(0.2, gap / hs * 0.2)
+            add(5, conf)
+
+        # --- Point: POINT, POLICE ---
+        if s["index_up"] and s["middle_down"] and s["ring_down"] and s["pinky_down"]:
+            if s["index_tip"][1] < s["index_mcp"][1] - 0.12 * hs:
+                add(9, 0.78)
+                add(17, 0.72)
+
+        # --- Three fingers: WATER ---
+        if s["index_up"] and s["middle_up"] and s["ring_up"] and s["pinky_down"]:
+            add(16, 0.75)
+
+        # --- Shaka: DOCTOR, CALL ---
+        if s["thumb_out"] and s["pinky_up"] and s["index_down"] and s["middle_down"] and s["ring_down"]:
+            add(12, 0.76)
+            add(15, 0.74)
+
+        # --- Rock (index+pinky): EMERGENCY ---
+        if s["index_up"] and s["pinky_up"] and s["middle_down"] and s["ring_down"]:
+            add(11, 0.73)
+
+        # --- C shape ---
+        if s["index_up"] and s["middle_up"]:
+            d = s["dist_thumb_index_tip"]
+            if 0.18 * hs < d < 0.65 * hs and not s["thumb_tucked"]:
+                if not (s["ring_up"] and s["pinky_up"]):
+                    add(3, 0.70)
+
+        # --- Thumb between index & middle: BATHROOM ---
+        if s["middle_up"] and s["index_up"] and s["ring_down"] and s["pinky_down"]:
+            if 0.08 * hs < s["dist_thumb_index_tip"] < 0.20 * hs:
+                add(19, 0.68)
+
+        # --- Flat hand tilted: PLEASE (3 fingers partial) ---
+        if s["index_up"] and s["middle_up"] and s["ring_down"] and s["pinky_down"] and s["thumb_tucked"]:
+            add(22, 0.62)
+
+        if not candidates:
+            return 0, 0.0
+
+        # Pick highest confidence; boost if multiple rules agree
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        best_id, best_conf = candidates[0]
+        agreeing = sum(1 for gid, _ in candidates if gid == best_id)
+        if agreeing > 1:
+            best_conf = min(1.0, best_conf + 0.05)
+        return best_id, best_conf
